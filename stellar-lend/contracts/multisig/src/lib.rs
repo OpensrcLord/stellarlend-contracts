@@ -496,6 +496,16 @@ impl MultisigContract {
         Self::require_signer(&env, &caller)?;
 
         let mut proposal = Self::fetch_proposal(&env, id)?;
+
+        // Ledger-based expiry guard (consistent with execute_proposal
+        // and approve_proposal): if the current ledger has passed
+        // expires_at the proposal is expired regardless of the stored
+        // status field.
+        if env.ledger().sequence() as u64 > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            Self::save_proposal(&env, &proposal);
+            return Err(MultisigError::ProposalExpired);
+        }
         if proposal.status == ProposalStatus::Expired {
             return Err(MultisigError::ProposalExpired);
         }
