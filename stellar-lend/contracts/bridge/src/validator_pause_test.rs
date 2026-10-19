@@ -1,0 +1,7 @@
+/// Tests for bridge validator-pause functionality.
+#[cfg(test)]
+#[allow(unused_imports)]
+use super::*;
+
+#[test]
+fn validator_pause_test_compile_smoke() {}
