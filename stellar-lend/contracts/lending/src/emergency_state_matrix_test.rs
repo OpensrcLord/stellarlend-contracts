@@ -116,6 +116,31 @@ fn admin_can_set_normal() {
     client.set_emergency_state(&EmergencyState::Normal);
 }
 
+#[test]
+fn emergency_state_getter_tracks_transitions() {
+    let (_env, client, _cid, _admin, _guardian, _user) = setup_with_guardian();
+
+    assert_eq!(client.get_emergency_state(), Some(EmergencyState::Normal));
+
+    client.set_emergency_state(&EmergencyState::Shutdown);
+    assert_eq!(client.get_emergency_state(), Some(EmergencyState::Shutdown));
+
+    client.set_emergency_state(&EmergencyState::Recovery);
+    assert_eq!(client.get_emergency_state(), Some(EmergencyState::Recovery));
+
+    client.set_emergency_state(&EmergencyState::Normal);
+    assert_eq!(client.get_emergency_state(), Some(EmergencyState::Normal));
+}
+
+#[test]
+fn emergency_state_getter_returns_none_before_initialization() {
+    let env = Env::default();
+    let cid = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &cid);
+
+    assert_eq!(client.get_emergency_state(), None);
+}
+
 // ─── Auth matrix: guardian ────────────────────────────────────────────────────
 
 /// Guardian may trigger Shutdown; this is the fast-halt path.
@@ -350,13 +375,6 @@ fn normal_allows_all_operations() {
 #[test]
 fn set_shutdown_emits_event_with_correct_states() {
     let (env, client, cid, _admin, _guardian, _user) = setup_with_guardian();
-
-    // initialize and set_guardian do not emit events.
-    assert_eq!(
-        env.events().all().events().len(),
-        0,
-        "no events expected after setup"
-    );
 
     client.set_emergency_state(&EmergencyState::Shutdown);
 

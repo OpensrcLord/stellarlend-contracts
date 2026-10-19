@@ -15,16 +15,20 @@
 //! Equivalently: `amount_out = (amount_in · (10000 − fee_bps) · reserve_out) /
 //! (reserve_in · 10000 + amount_in · (10000 − fee_bps))`.
 //!
-//! Public entry points (`pub fn`, no auth required):
-//! - [`init_pool`] — initialise reserves A/B and LP total supply. Returns `Result<(), AmmPoolError>`.
-//! - [`add_liquidity`] — deposit tokens, mint LP shares via donation-attack-resistant math. Returns `Result<i128, AmmPoolError>` (shares minted).
+//! Public entry points:
+//! - [`init_pool`] — initialise reserves A/B and LP total supply (admin-only:
+//!   the supplied `admin` must authorize via `require_auth()` and, once an
+//!   admin identity is stored, must match the stored pool admin). Returns
+//!   `Result<(), AmmPoolError>`.
+//! - [`add_liquidity`] — deposit tokens, mint LP shares via donation-attack-resistant math. Takes `(desired, min)` amounts, `min_shares` and a `deadline`; returns `Result<(i128, i128, i128), AmmPoolError>` (amount_a, amount_b, shares minted).
 //! - [`remove_liquidity`] — burn LP shares for proportional reserves. Returns `Result<(i128, i128), AmmPoolError>` (tokens returned).
 //! - [`swap_a_for_b`] — fee‑adjusted constant‑product swap A → B. Returns `Result<i128, AmmPoolError>` (amount_out).
+//! - [`swap_b_for_a`] — fee‑adjusted constant‑product swap B → A (mirror of `swap_a_for_b` with token roles reversed). Returns `Result<i128, AmmPoolError>` (amount_out).
 //! - [`get_reserves`] — read both reserves for inspection / tests. Returns `(i128, i128)`.
 //!
 //! Notes for downstream callers:
-//! - Input validation is enforced via `panic!` (this is a test‑grade surface, not a production safety
-//!   wrapper); callers should pre‑validate non‑negative amounts and `0 ≤ fee_bps ≤ 10000` off‑chain.
+//! - Input validation is enforced via typed `Result` errors (`AmmPoolError`); callers should
+//!   pre‑validate non‑negative amounts and `0 ≤ fee_bps ≤ 10000` off‑chain.
 //! - The k‑invariant is enforced by [`assert_k_monotonic`] after every reserve mutation.
 //! - Flash‑swap APIs — [`AmmContract::flash_swap_a_for_b`] and
 //!   [`AmmContract::repay_flash_swap`] — implement the "optimistic transfer
@@ -35,6 +39,8 @@
 pub mod liquidity_math;
 pub mod math;
 
+#[cfg(test)]
+mod admin_authorization_test;
 #[cfg(test)]
 mod error_codes_test;
 #[cfg(test)]
@@ -52,7 +58,11 @@ mod flash_swap_test;
 #[cfg(test)]
 mod inverse_swap_doc_example_test;
 #[cfg(test)]
+mod liquidity_bounds_test;
+#[cfg(test)]
 mod mint_shares_proptest;
+#[cfg(test)]
+mod repay_flash_swap_contract_test;
 #[cfg(test)]
 mod sqrt_precision_test;
 #[cfg(test)]
@@ -64,7 +74,8 @@ use soroban_sdk::{
 };
 
 use crate::liquidity_math::{
-    calculate_burn_amounts, calculate_mint_shares, LiquidityMathError, MINIMUM_LIQUIDITY,
+    calculate_burn_amounts, calculate_mint_shares, quote_optimal_amounts, LiquidityMathError,
+    MINIMUM_LIQUIDITY,
 };
 
 pub struct FeeTier {
@@ -198,9 +209,12 @@ const KEY_FEE_BPS: (&str, &str) = ("pool", "fee_bps");
 // See: [DUST_SWAP_GUARD.md](../DUST_SWAP_GUARD.md)
 const KEY_MIN_SWAP_IN: (&str, &str) = ("pool", "min_swap_in");
 
-// Pool admin identity. Set on the first `init_pool` call (first-caller-wins).
-// All admin-gated setters (`init_pool`, `set_max_impact_bps`, `set_fee_bps`,
-// `set_min_swap_in`) require the stored admin's authorization once it exists.
+// Pool admin identity. Set by `init_pool` from its authenticated `admin`
+// parameter (first caller wins — the identity cannot be replaced without
+// calling the contract's own admin, so it is effectively immutable here).
+// All admin-gated entry points (`init_pool`, `set_max_impact_bps`,
+// `set_fee_bps`, `set_min_swap_in`, `set_min_liquidity`) require the stored
+// admin's authorization once the identity exists.
 const KEY_ADMIN: (&str, &str) = ("pool", "admin");
 
 // LP share tracking — total supply and per-user balances.
@@ -285,6 +299,16 @@ pub enum AmmPoolError {
     /// below the admin-configured `min_liquidity` floor.
     /// See [MIN_LIQUIDITY.md](../MIN_LIQUIDITY.md).
     BelowMinLiquidity = 17,
+    /// A liquidity operation produced less than the caller's minimum
+    /// (`amount_*_min` / `min_shares`), or a swap's computed output is below
+    /// the caller's `min_amount_out`.
+    SlippageExceeded = 18,
+    /// The ledger timestamp is past the caller-supplied `deadline`.
+    DeadlineExpired = 19,
+    /// Swap would move the spot price by more than `max_impact_bps`.
+    PriceImpactExceeded = 20,
+    /// The trader may not be the pool contract itself.
+    InvalidTrader = 21,
 }
 
 /// Return value of [`AmmContract::get_swap_quote`].
@@ -313,6 +337,13 @@ pub struct AmmContract;
 impl AmmContract {
     /// Initialize pool reserves.
     ///
+    /// Admin only. `admin` must authorize the call via `require_auth()` and,
+    /// once a pool admin identity is stored, must match the stored admin —
+    /// mirroring [`set_fee_bps`](AmmContract::set_fee_bps).  The first
+    /// successful `init_pool` call locks in its `admin` argument as the
+    /// pool admin (first-caller-wins); later calls are restricted to that
+    /// same address so a third party cannot reset the reserves.
+    ///
     /// Gated by the `FlashActive` reentrancy guard so that a flash swap
     /// initiated on a stale pool cannot be silently clobbered by a
     /// follow-up `init_pool` from the same transaction.
@@ -320,17 +351,26 @@ impl AmmContract {
     /// Stores the token contract addresses for A and B so that
     /// `add_liquidity` and `remove_liquidity` can perform real token
     /// transfers.  Resets both fee accumulators and LP total supply to zero.
-    /// The caller becomes the pool admin (first-caller-wins).
     pub fn init_pool(
         env: Env,
+        admin: Address,
         a: i128,
         b: i128,
         token_a: Address,
         token_b: Address,
     ) -> Result<(), AmmPoolError> {
         Self::assert_no_active_flash_swap(&env)?;
-        // Admin is set externally via set_fee_bps / set_max_impact_bps;
-        // init_pool does not lock in a default admin.
+        // Admin-gated: authorize the caller, enforce the stored admin
+        // identity, and lock it in on first initialization.
+        Self::require_stored_admin(&env, &admin)?;
+        if env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&KEY_ADMIN)
+            .is_none()
+        {
+            env.storage().persistent().set(&KEY_ADMIN, &admin);
+        }
         env.storage().persistent().set(&KEY_RES_A, &a);
         env.storage().persistent().set(&KEY_RES_B, &b);
         env.storage().persistent().set(&KEY_TOKEN_A, &token_a);
@@ -364,13 +404,31 @@ impl AmmContract {
         Ok(())
     }
 
-    /// Verify that `admin` matches the stored pool admin.
+    /// Verify that `admin` is authorized for this call and matches the
+    /// stored pool admin (when one exists).
+    ///
+    /// Mirrors `set_fee_bps`'s auth model: the supplied address must
+    /// authorize the invocation via `require_auth()`, and once an admin
+    /// identity has been persisted (by `init_pool`), any other address is
+    /// rejected with [`AmmPoolError::UnauthorizedCaller`] even though it
+    /// can always authorize its *own* transactions.
+    fn require_stored_admin(env: &Env, admin: &Address) -> Result<(), AmmPoolError> {
+        Self::require_admin(env, admin)?;
+        if let Some(stored) = env.storage().persistent().get::<_, Address>(&KEY_ADMIN) {
+            if &stored != admin {
+                return Err(AmmPoolError::UnauthorizedCaller);
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify that `admin` is authorized for this call.
     fn require_admin(_env: &Env, admin: &Address) -> Result<(), AmmPoolError> {
         admin.require_auth();
         Ok(())
     }
 
-    /// Return the current pool admin address.
+    /// Return the current pool admin address, if one has been locked in.
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().persistent().get(&KEY_ADMIN)
     }
@@ -399,15 +457,16 @@ impl AmmContract {
     /// and allow swaps of any size (backward-compatible default).
     ///
     /// # Arguments
-    /// * `_admin`         — caller address (auth checked by the caller in
-    ///                      production; kept in signature for future ACL).
+    /// * `admin`          — pool admin; must authorize via `require_auth()`
+    ///                      and match the stored admin identity (see
+    ///                      [`require_admin`](AmmContract::require_admin)).
     /// * `max_impact_bps` — maximum impact in BPS, or `IMPACT_GUARD_DISABLED`.
     pub fn set_max_impact_bps(
         env: Env,
         admin: Address,
         max_impact_bps: u32,
     ) -> Result<(), AmmPoolError> {
-        Self::require_admin(&env, &admin)?;
+        Self::require_stored_admin(&env, &admin)?;
         env.storage()
             .persistent()
             .set(&KEY_MAX_IMPACT_BPS, &max_impact_bps);
@@ -572,15 +631,38 @@ impl AmmContract {
     /// so that reported reserves always reflect actual on-chain balances.
     /// Also asserts k-monotonicity (k must not decrease).
     ///
-    /// Returns the number of LP shares minted to the caller.
+    /// Uniswap-router-style `(desired, min)` parameters: the amounts actually
+    /// pulled are the optimal amounts from [`quote_optimal_amounts`] (never
+    /// more than `*_desired`), so any off-ratio excess stays with the caller.
+    /// Reverts with [`AmmPoolError::SlippageExceeded`] if an optimal amount is
+    /// below `amount_a_min` / `amount_b_min` or the minted shares are below
+    /// `min_shares`, and with [`AmmPoolError::DeadlineExpired`] when
+    /// `now > deadline` (ledger timestamp). Mins must be `>= 0`.
+    ///
+    /// Returns `(amount_a, amount_b, shares)` — tokens pulled and LP shares
+    /// minted to the caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_liquidity(
         env: Env,
         caller: Address,
-        add_a: i128,
-        add_b: i128,
-    ) -> Result<i128, AmmPoolError> {
+        amount_a_desired: i128,
+        amount_b_desired: i128,
+        amount_a_min: i128,
+        amount_b_min: i128,
+        min_shares: i128,
+        deadline: u64,
+    ) -> Result<(i128, i128, i128), AmmPoolError> {
         caller.require_auth();
         Self::assert_no_active_flash_swap(&env)?;
+        if env.ledger().timestamp() > deadline {
+            return Err(AmmPoolError::DeadlineExpired);
+        }
+        if amount_a_min < 0 || amount_b_min < 0 || min_shares < 0 {
+            return Err(AmmPoolError::NonPositiveAmount);
+        }
+        if amount_a_desired <= 0 || amount_b_desired <= 0 {
+            return Err(AmmPoolError::NonPositiveAmount);
+        }
         let ra: i128 = env.storage().persistent().get(&KEY_RES_A).unwrap_or(0);
         let rb: i128 = env.storage().persistent().get(&KEY_RES_B).unwrap_or(0);
         let total_supply: i128 = env
@@ -588,6 +670,17 @@ impl AmmContract {
             .persistent()
             .get(&KEY_LP_TOTAL_SUPPLY)
             .unwrap_or(0);
+
+        let (add_a, add_b) =
+            quote_optimal_amounts(amount_a_desired, amount_b_desired, ra, rb).map_err(|e| {
+                match e {
+                    LiquidityMathError::Overflow => AmmPoolError::Overflow,
+                    _ => AmmPoolError::InvariantViolation,
+                }
+            })?;
+        if add_a < amount_a_min || add_b < amount_b_min {
+            return Err(AmmPoolError::SlippageExceeded);
+        }
 
         // Compute LP shares to mint using the donation-attack-resistant formula.
         let (shares, locked) =
@@ -601,6 +694,9 @@ impl AmmContract {
                 LiquidityMathError::ZeroSupply => AmmPoolError::ZeroSupply,
                 LiquidityMathError::BurnExceedsSupply => AmmPoolError::BurnExceedsSupply,
             })?;
+        if shares < min_shares {
+            return Err(AmmPoolError::SlippageExceeded);
+        }
 
         let new_ra = ra.checked_add(add_a).ok_or(AmmPoolError::Overflow)?;
         let new_rb = rb.checked_add(add_b).ok_or(AmmPoolError::Overflow)?;
@@ -641,7 +737,7 @@ impl AmmContract {
             .ok_or(AmmPoolError::Overflow)?;
         env.storage().persistent().set(&lp_key, &new_user_balance);
 
-        Ok(shares)
+        Ok((add_a, add_b, shares))
     }
 
     /// Remove liquidity by burning LP shares.
@@ -654,14 +750,29 @@ impl AmmContract {
     /// Requires the caller's authorization and sufficient LP balance.
     /// Also asserts k-monotonicity (k must not increase on removal).
     ///
+    /// `amount_a_min` / `amount_b_min` are the minimum acceptable payouts
+    /// (must be `>= 0`); a lower payout reverts with
+    /// [`AmmPoolError::SlippageExceeded`]. `deadline` is a ledger timestamp;
+    /// the call reverts with [`AmmPoolError::DeadlineExpired`] when
+    /// `now > deadline`.
+    ///
     /// Returns `(amount_a, amount_b)` — the tokens transferred to the caller.
     pub fn remove_liquidity(
         env: Env,
         caller: Address,
         shares: i128,
+        amount_a_min: i128,
+        amount_b_min: i128,
+        deadline: u64,
     ) -> Result<(i128, i128), AmmPoolError> {
         caller.require_auth();
         Self::assert_no_active_flash_swap(&env)?;
+        if env.ledger().timestamp() > deadline {
+            return Err(AmmPoolError::DeadlineExpired);
+        }
+        if amount_a_min < 0 || amount_b_min < 0 {
+            return Err(AmmPoolError::NonPositiveAmount);
+        }
 
         // Validate caller's LP balance.
         let lp_key = LpBalanceKey::User(caller.clone());
@@ -691,6 +802,10 @@ impl AmmContract {
                 LiquidityMathError::ZeroReserve => AmmPoolError::ZeroReserve,
                 LiquidityMathError::InsufficientLiquidityMinted => AmmPoolError::Overflow,
             })?;
+
+        if amount_a < amount_a_min || amount_b < amount_b_min {
+            return Err(AmmPoolError::SlippageExceeded);
+        }
 
         let new_ra = ra
             .checked_sub(amount_a)
@@ -781,112 +896,27 @@ impl AmmContract {
     /// The fee accumulator (`KEY_FEE_A`) uses saturating addition. If the
     /// counter reaches `i128::MAX` it stops incrementing but never panics.
     /// This guarantees the swap cannot be halted by fee-accumulation overflow.
-    pub fn swap_a_for_b(env: Env, amount_in: i128) -> Result<i128, AmmPoolError> {
-        Self::assert_no_active_flash_swap(&env)?;
-        if amount_in <= 0 {
-            return Err(AmmPoolError::NonPositiveAmount);
-        }
-        // Optional admin floor (default 0 = disabled).
-        let min_swap_in: i128 = env
-            .storage()
-            .persistent()
-            .get(&KEY_MIN_SWAP_IN)
-            .unwrap_or(DEFAULT_MIN_SWAP_IN);
-        if min_swap_in > 0 && amount_in < min_swap_in {
-            return Err(AmmPoolError::AmountBelowMinSwapIn);
-        }
-        let ra: i128 = env.storage().persistent().get(&KEY_RES_A).unwrap_or(0);
-        let rb: i128 = env.storage().persistent().get(&KEY_RES_B).unwrap_or(0);
-        if ra <= 0 || rb <= 0 {
-            return Err(AmmPoolError::EmptyPool);
-        }
-
-        // Read the protocol-owned fee from storage (never caller-supplied).
-        let fee_bps: i128 = env
-            .storage()
-            .persistent()
-            .get(&KEY_FEE_BPS)
-            .unwrap_or(DEFAULT_FEE_BPS);
-
-        let fee = compute_fee(amount_in, fee_bps)?;
-
-        // Uniswap v2 style: amount_in_with_fee = amount_in * (10000 - fee_bps)
-        let fee_adj = 10_000_i128
-            .checked_sub(fee_bps)
-            .ok_or(AmmPoolError::Overflow)?;
-        let amount_in_with_fee = amount_in
-            .checked_mul(fee_adj)
-            .ok_or(AmmPoolError::Overflow)?;
-
-        // numerator = amount_in_with_fee * reserve_out
-        let numerator = amount_in_with_fee
-            .checked_mul(rb)
-            .ok_or(AmmPoolError::Overflow)?;
-        // denominator = reserve_in * 10000 + amount_in_with_fee
-        let denom_part = ra.checked_mul(10_000_i128).ok_or(AmmPoolError::Overflow)?;
-        let denominator = denom_part
-            .checked_add(amount_in_with_fee)
-            .ok_or(AmmPoolError::Overflow)?;
-
-        let amount_out = numerator / denominator;
-
-        // Dust-swap guard: reject zero-output swaps so input is never
-        // consumed without an economic exchange of the output asset.
-        if amount_out == 0 {
-            return Err(AmmPoolError::ZeroOutput);
-        }
-
-        let new_ra = ra.checked_add(amount_in).ok_or(AmmPoolError::Overflow)?;
-        let new_rb = rb.checked_sub(amount_out).ok_or(AmmPoolError::Overflow)?;
-
-        // Minimum-liquidity floor guard. For A→B, only reserve B decreases;
-        // reserve A grows. Only the outgoing reserve is checked (matches the
-        // documented policy in MIN_LIQUIDITY.md §"Floor only protects the
-        // outgoing reserve on swaps").
-        let floor = Self::get_min_liquidity(env.clone());
-        if floor > 0 && new_rb < floor {
-            return Err(AmmPoolError::BelowMinLiquidity);
-        }
-
-        assert_k_monotonic(ra, rb, new_ra, new_rb, true)?;
-
-        let accrued_fee_a: i128 = env.storage().persistent().get(&KEY_FEE_A).unwrap_or(0);
-        let new_fee_a = accrued_fee_a.saturating_add(fee);
-
-        // ---- Price-impact guard ----
-        // Spot price before  = rb  / ra   (units of B per A).
-        // Spot price after   = new_rb / new_ra.
-        // Relative impact (BPS) = (1 - new_rb * ra / (rb * new_ra)) * 10_000.
-        // We reject if impact_bps > max_impact_bps.
-        let max_impact: u32 = env
-            .storage()
-            .persistent()
-            .get(&KEY_MAX_IMPACT_BPS)
-            .unwrap_or(IMPACT_GUARD_DISABLED);
-        if max_impact != IMPACT_GUARD_DISABLED {
-            // Numerator of the "price ratio after / before":
-            //   ratio_num = new_rb * ra
-            //   ratio_den = rb     * new_ra
-            // impact_bps = (1 - ratio_num / ratio_den) * 10_000
-            //            = (ratio_den - ratio_num) * 10_000 / ratio_den
-            let ratio_num = new_rb.checked_mul(ra).expect("impact overflow");
-            let ratio_den = rb.checked_mul(new_ra).expect("impact overflow");
-            let impact_bps = (ratio_den - ratio_num)
-                .checked_mul(10_000)
-                .expect("impact overflow")
-                / ratio_den;
-            if impact_bps > max_impact as i128 {
-                panic!(
-                    "PriceImpactExceeded: impact_bps={}, max={}",
-                    impact_bps, max_impact
-                );
-            }
-        }
-
-        env.storage().persistent().set(&KEY_RES_A, &new_ra);
-        env.storage().persistent().set(&KEY_RES_B, &new_rb);
-        env.storage().persistent().set(&KEY_FEE_A, &new_fee_a);
-        Ok(amount_out)
+    ///
+    /// # Settlement
+    ///
+    /// `trader` must authorize the call. `amount_in` of token A is pulled from
+    /// `trader` into the pool before reserves are updated and `amount_out` of
+    /// token B is paid to `trader` afterwards, so stored reserves always equal
+    /// the pool's real token balances. The per-token fee accumulators are
+    /// informational: the fee stays inside the reserves (it is a subset of
+    /// them, not an extra balance). Fee-on-transfer tokens are unsupported.
+    ///
+    /// # Slippage
+    ///
+    /// Fails with [`AmmPoolError::SlippageExceeded`] (moving nothing) when the
+    /// computed output is below `min_amount_out`.
+    pub fn swap_a_for_b(
+        env: Env,
+        trader: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> Result<i128, AmmPoolError> {
+        Self::swap_internal(&env, &trader, amount_in, min_amount_out, true)
     }
 
     /// Swap from B -> A using the same Uniswap-v2 constant-product formula and
@@ -924,10 +954,40 @@ impl AmmContract {
     ///
     /// Identical to [`swap_a_for_b`]: the fee accumulator saturates at
     /// `i128::MAX` and never panics on addition.
-    pub fn swap_b_for_a(env: Env, amount_in: i128) -> Result<i128, AmmPoolError> {
+    ///
+    /// # Settlement
+    ///
+    /// Mirror of [`swap_a_for_b`]: `trader` authorizes, `amount_in` of token B
+    /// is pulled in before the reserve update and `amount_out` of token A is
+    /// paid out afterwards. Same guards (flash-active, min-in, price impact,
+    /// min-liquidity, k-monotonic) and the same `min_amount_out` bound.
+    pub fn swap_b_for_a(
+        env: Env,
+        trader: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> Result<i128, AmmPoolError> {
+        Self::swap_internal(&env, &trader, amount_in, min_amount_out, false)
+    }
+
+    /// Shared implementation of both swap directions so every guard is
+    /// identical. `a_for_b == true` sells token A for token B.
+    fn swap_internal(
+        env: &Env,
+        trader: &Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        a_for_b: bool,
+    ) -> Result<i128, AmmPoolError> {
+        if *trader == env.current_contract_address() {
+            return Err(AmmPoolError::InvalidTrader);
+        }
+        trader.require_auth();
+        Self::assert_no_active_flash_swap(env)?;
         if amount_in <= 0 {
             return Err(AmmPoolError::NonPositiveAmount);
         }
+        // Optional admin floor (default 0 = disabled).
         let min_swap_in: i128 = env
             .storage()
             .persistent()
@@ -949,49 +1009,90 @@ impl AmmContract {
             .get(&KEY_FEE_BPS)
             .unwrap_or(DEFAULT_FEE_BPS);
 
-        let fee = compute_fee(amount_in, fee_bps)?;
+        let (amount_out, fee) = compute_swap_out(ra, rb, amount_in, fee_bps, a_for_b)?;
 
-        // Mirror of swap_a_for_b with A and B roles swapped.
-        let fee_adj = 10_000_i128
-            .checked_sub(fee_bps)
-            .ok_or(AmmPoolError::Overflow)?;
-        let amount_in_with_fee = amount_in
-            .checked_mul(fee_adj)
-            .ok_or(AmmPoolError::Overflow)?;
-
-        // reserve_out is A, reserve_in is B
-        let numerator = amount_in_with_fee
-            .checked_mul(ra)
-            .ok_or(AmmPoolError::Overflow)?;
-        let denom_part = rb.checked_mul(10_000_i128).ok_or(AmmPoolError::Overflow)?;
-        let denominator = denom_part
-            .checked_add(amount_in_with_fee)
-            .ok_or(AmmPoolError::Overflow)?;
-
-        let amount_out = numerator / denominator; // floor — pool never over-pays
-
-        // Dust-swap guard (mirrors swap_a_for_b).
+        // Dust-swap guard: reject zero-output swaps so input is never
+        // consumed without an economic exchange of the output asset.
         if amount_out == 0 {
             return Err(AmmPoolError::ZeroOutput);
         }
+        if amount_out < min_amount_out {
+            return Err(AmmPoolError::SlippageExceeded);
+        }
 
-        let new_rb = rb.checked_add(amount_in).ok_or(AmmPoolError::Overflow)?;
-        let new_ra = ra.checked_sub(amount_out).ok_or(AmmPoolError::Overflow)?;
+        let (res_in, res_out) = if a_for_b { (ra, rb) } else { (rb, ra) };
+        let new_in = res_in
+            .checked_add(amount_in)
+            .ok_or(AmmPoolError::Overflow)?;
+        let new_out = res_out
+            .checked_sub(amount_out)
+            .ok_or(AmmPoolError::Overflow)?;
+        let (new_ra, new_rb) = if a_for_b {
+            (new_in, new_out)
+        } else {
+            (new_out, new_in)
+        };
 
-        // Minimum-liquidity floor guard. For B→A, only reserve A decreases.
+        // Minimum-liquidity floor guard: only the outgoing reserve decreases
+        // (MIN_LIQUIDITY.md §"Floor only protects the outgoing reserve on swaps").
         let floor = Self::get_min_liquidity(env.clone());
-        if floor > 0 && new_ra < floor {
+        if floor > 0 && new_out < floor {
             return Err(AmmPoolError::BelowMinLiquidity);
         }
 
         assert_k_monotonic(ra, rb, new_ra, new_rb, true)?;
 
-        let accrued_fee_b: i128 = env.storage().persistent().get(&KEY_FEE_B).unwrap_or(0);
-        let new_fee_b = accrued_fee_b.saturating_add(fee);
+        // ---- Price-impact guard ----
+        // Spot price (out per in) before = res_out / res_in, after =
+        // new_out / new_in.
+        // impact_bps = (1 - new_out * res_in / (res_out * new_in)) * 10_000
+        //            = (ratio_den - ratio_num) * 10_000 / ratio_den
+        let max_impact: u32 = env
+            .storage()
+            .persistent()
+            .get(&KEY_MAX_IMPACT_BPS)
+            .unwrap_or(IMPACT_GUARD_DISABLED);
+        if max_impact != IMPACT_GUARD_DISABLED {
+            let ratio_num = new_out.checked_mul(res_in).ok_or(AmmPoolError::Overflow)?;
+            let ratio_den = res_out.checked_mul(new_in).ok_or(AmmPoolError::Overflow)?;
+            let impact_bps = ratio_den
+                .checked_sub(ratio_num)
+                .and_then(|d| d.checked_mul(10_000))
+                .ok_or(AmmPoolError::Overflow)?
+                / ratio_den;
+            if impact_bps > max_impact as i128 {
+                return Err(AmmPoolError::PriceImpactExceeded);
+            }
+        }
+
+        let (fee_key, token_in_key, token_out_key) = if a_for_b {
+            (KEY_FEE_A, KEY_TOKEN_A, KEY_TOKEN_B)
+        } else {
+            (KEY_FEE_B, KEY_TOKEN_B, KEY_TOKEN_A)
+        };
+        let token_in: Address = env
+            .storage()
+            .persistent()
+            .get(&token_in_key)
+            .ok_or(AmmPoolError::EmptyPool)?;
+        let token_out: Address = env
+            .storage()
+            .persistent()
+            .get(&token_out_key)
+            .ok_or(AmmPoolError::EmptyPool)?;
+        let accrued_fee: i128 = env.storage().persistent().get(&fee_key).unwrap_or(0);
+
+        // Pull the input before touching reserves, pay the output after.
+        let pool = env.current_contract_address();
+        TokenClient::new(env, &token_in).transfer(trader, &pool, &amount_in);
 
         env.storage().persistent().set(&KEY_RES_A, &new_ra);
         env.storage().persistent().set(&KEY_RES_B, &new_rb);
-        env.storage().persistent().set(&KEY_FEE_B, &new_fee_b);
+        env.storage()
+            .persistent()
+            .set(&fee_key, &accrued_fee.saturating_add(fee));
+
+        TokenClient::new(env, &token_out).transfer(&pool, trader, &amount_out);
         Ok(amount_out)
     }
 
@@ -1021,9 +1122,9 @@ impl AmmContract {
     /// entry points within a single multi-operation transaction:
     ///
     /// ```text
-    /// Op 1: AMM.flash_swap_a_for_b(amount_out, fee_bps)
+    /// Op 1: AMM.flash_swap_a_for_b(caller, amount_out, params)
     /// Op 2: <caller runs arbitrary logic on asset A received elsewhere>
-    /// Op 3: AMM.repay_flash_swap(amount_in)        // verify-k runs here
+    /// Op 3: AMM.repay_flash_swap(caller, amount_in) // verify-k runs here
     /// ```
     ///
     /// Soroban rolls back every storage write in the whole transaction if
@@ -1063,7 +1164,7 @@ impl AmmContract {
     /// perturbs reserves.  See [DUST_SWAP_GUARD.md](../DUST_SWAP_GUARD.md).
     ///
     /// # Returns
-    /// `amount_out` — the number of asset-B units debited from the pool.
+    /// * `Ok(amount_out)` — the number of asset-B units debited from the pool.
     ///
     /// # Errors
     /// * [`AmmPoolError::ReentrantFlashSwap`] — a flash swap is already in flight.
@@ -1265,32 +1366,8 @@ impl AmmContract {
             return Err(AmmPoolError::EmptyPool);
         }
 
-        let fee = compute_fee(amount_in, fee_bps)?;
-
-        // Uniswap-v2 constant-product formula (identical to live swap path).
-        //   amount_in_with_fee = amount_in * (10_000 - fee_bps)
-        //   amount_out = (amount_in_with_fee * reserve_out)
-        //              / (reserve_in * 10_000 + amount_in_with_fee)
-        let fee_adj = 10_000_i128
-            .checked_sub(fee_bps)
-            .ok_or(AmmPoolError::Overflow)?;
-        let amount_in_with_fee = amount_in
-            .checked_mul(fee_adj)
-            .ok_or(AmmPoolError::Overflow)?;
-
-        let (reserve_in, reserve_out) = if a_for_b { (ra, rb) } else { (rb, ra) };
-
-        let numerator = amount_in_with_fee
-            .checked_mul(reserve_out)
-            .ok_or(AmmPoolError::Overflow)?;
-        let denom_part = reserve_in
-            .checked_mul(10_000_i128)
-            .ok_or(AmmPoolError::Overflow)?;
-        let denominator = denom_part
-            .checked_add(amount_in_with_fee)
-            .ok_or(AmmPoolError::Overflow)?;
-
-        let amount_out = numerator / denominator;
+        // Same math helper as the live swap path, so quotes are exact.
+        let (amount_out, fee) = compute_swap_out(ra, rb, amount_in, fee_bps, a_for_b)?;
 
         let (reserve_a_after, reserve_b_after) = if a_for_b {
             (
@@ -1451,6 +1528,45 @@ fn compute_fee(amount_in: i128, fee_bps: i128) -> Result<i128, AmmPoolError> {
         / 10_000)
 }
 
+/// Shared constant-product math for live swaps and [`AmmContract::get_swap_quote`].
+///
+/// Returns `(amount_out, fee)`:
+///
+/// ```text
+/// amount_in_with_fee = amount_in * (10_000 - fee_bps)
+/// amount_out = (amount_in_with_fee * reserve_out)
+///            / (reserve_in * 10_000 + amount_in_with_fee)   [floor]
+/// ```
+///
+/// Output is floored so the pool never over-pays. All arithmetic is checked
+/// and surfaces [`AmmPoolError::Overflow`].
+fn compute_swap_out(
+    ra: i128,
+    rb: i128,
+    amount_in: i128,
+    fee_bps: i128,
+    a_for_b: bool,
+) -> Result<(i128, i128), AmmPoolError> {
+    let fee = compute_fee(amount_in, fee_bps)?;
+    let fee_adj = 10_000_i128
+        .checked_sub(fee_bps)
+        .ok_or(AmmPoolError::Overflow)?;
+    let amount_in_with_fee = amount_in
+        .checked_mul(fee_adj)
+        .ok_or(AmmPoolError::Overflow)?;
+    let (reserve_in, reserve_out) = if a_for_b { (ra, rb) } else { (rb, ra) };
+    let numerator = amount_in_with_fee
+        .checked_mul(reserve_out)
+        .ok_or(AmmPoolError::Overflow)?;
+    let denom_part = reserve_in
+        .checked_mul(10_000_i128)
+        .ok_or(AmmPoolError::Overflow)?;
+    let denominator = denom_part
+        .checked_add(amount_in_with_fee)
+        .ok_or(AmmPoolError::Overflow)?;
+    Ok((numerator / denominator, fee))
+}
+
 /// Inverse of the verify-k condition: returns the **minimum** `amount_in`
 /// of asset A that a flash-swap receiver must repay to keep
 /// `k = ra * rb` non-decreasing after the corresponding optimistic
@@ -1489,6 +1605,9 @@ pub(crate) fn inverse_swap_in(ra: i128, rb: i128, amount_out: i128, _fee_bps: i1
 mod swap_bounds_proptest;
 
 #[cfg(test)]
+pub(crate) mod swap_test_util;
+
+#[cfg(test)]
 mod price_impact_test;
 
 // ---------------------------------------------------------------------------
@@ -1521,8 +1640,10 @@ mod inline_test {
         let id = env.register(AmmContract, ());
         let client = AmmContractClient::new(&env, &id);
 
-        let token_a = Address::generate(&env);
-        let token_b = Address::generate(&env);
+        let token_a = crate::swap_test_util::register_token(&env);
+        let token_b = crate::swap_test_util::register_token(&env);
+        let admin = Address::generate(&env);
+        let trader = crate::swap_test_util::new_trader(&env, &token_a, &token_b);
 
         let reserve_sizes = [1_000_i128, 10_000, 100_000, 1_000_000];
         // Start from 2: amount_in=1 floors to zero output under the dust guard
@@ -1532,9 +1653,10 @@ mod inline_test {
         for &ra in reserve_sizes.iter() {
             for &rb in reserve_sizes.iter() {
                 for &amt in amounts.iter() {
-                    client.init_pool(&ra, &rb, &token_a, &token_b);
+                    client.init_pool(&admin, &ra, &rb, &token_a, &token_b);
+                    crate::swap_test_util::fund_pool(&env, &id, &token_a, &token_b, ra, rb);
                     // swap using stored fee (default 30 bps)
-                    let res = client.try_swap_a_for_b(&amt);
+                    let res = client.try_swap_a_for_b(&trader, &amt, &0);
                     if res == Err(Ok(AmmPoolError::ZeroOutput)) {
                         // Dust input that floors to zero output (e.g. a
                         // small amt against a much larger ra) is rejected
@@ -1566,6 +1688,7 @@ mod inline_test {
         let client = AmmContractClient::new(&env, &id);
 
         let caller = generate_address(&env);
+        let pool_admin = generate_address(&env);
         let a_admin = generate_address(&env);
         let b_admin = generate_address(&env);
         let ta = env.register_stellar_asset_contract(a_admin);
@@ -1573,8 +1696,8 @@ mod inline_test {
         soroban_sdk::token::StellarAssetClient::new(&env, &ta).mint(&caller, &1_000_i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &tb).mint(&caller, &2_000_i128);
 
-        client.init_pool(&1000, &2000, &ta, &tb);
-        client.add_liquidity(&caller, &100, &200);
+        client.init_pool(&pool_admin, &1000, &2000, &ta, &tb);
+        client.add_liquidity(&caller, &100, &200, &0, &0, &0, &u64::MAX);
         let (ra1, rb1) = client.get_reserves();
         let k1 = ra1.checked_mul(rb1).unwrap();
 
@@ -1582,7 +1705,7 @@ mod inline_test {
         let lp_balance = client.get_lp_balance(&caller);
         assert!(lp_balance > 0, "should have received LP shares");
         let burn_shares = lp_balance / 2;
-        let (rem_a, rem_b) = client.remove_liquidity(&caller, &burn_shares);
+        let (rem_a, rem_b) = client.remove_liquidity(&caller, &burn_shares, &0, &0, &u64::MAX);
         let (ra2, rb2) = client.get_reserves();
         let k2 = ra2.checked_mul(rb2).unwrap();
 
@@ -1609,10 +1732,11 @@ mod inline_test {
         soroban_sdk::token::StellarAssetClient::new(&env, &ta).mint(&caller, &1001_i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &tb).mint(&caller, &1001_i128);
 
-        client.init_pool(&0_i128, &0_i128, &ta, &tb);
+        client.init_pool(&caller, &0_i128, &0_i128, &ta, &tb);
 
         // First deposit: 1001 of each token → sqrt(1001*1001)=1001, shares=1, locked=1000
-        let shares = client.add_liquidity(&caller, &1001_i128, &1001_i128);
+        let (_, _, shares) =
+            client.add_liquidity(&caller, &1001_i128, &1001_i128, &0, &0, &0, &u64::MAX);
         assert_eq!(shares, 1);
 
         let lp_balance = client.get_lp_balance(&caller);
@@ -1641,17 +1765,18 @@ mod inline_test {
         soroban_sdk::token::StellarAssetClient::new(&env, &ta).mint(&caller, &10000_i128);
         soroban_sdk::token::StellarAssetClient::new(&env, &tb).mint(&caller, &10000_i128);
 
-        client.init_pool(&0_i128, &0_i128, &ta, &tb);
+        client.init_pool(&caller, &0_i128, &0_i128, &ta, &tb);
 
         // Deposit 10000 of each token.
-        let shares = client.add_liquidity(&caller, &10000_i128, &10000_i128);
+        let (_, _, shares) =
+            client.add_liquidity(&caller, &10000_i128, &10000_i128, &0, &0, &0, &u64::MAX);
         assert!(shares > 0);
 
         let (ra, rb) = client.get_reserves();
 
         // Burn all shares → should get back all reserves.
         let lp_balance = client.get_lp_balance(&caller);
-        let (amount_a, amount_b) = client.remove_liquidity(&caller, &lp_balance);
+        let (amount_a, amount_b) = client.remove_liquidity(&caller, &lp_balance, &0, &0, &u64::MAX);
 
         // Due to rounding-down on burn, amounts returned may be slightly less
         // than reserves. Verify that reserves are drained appropriately.
@@ -1674,9 +1799,9 @@ mod inline_test {
         let token_b = generate_address(&env);
         let caller = generate_address(&env);
 
-        client.init_pool(&0_i128, &0_i128, &token_a, &token_b);
+        client.init_pool(&caller, &0_i128, &0_i128, &token_a, &token_b);
         // sqrt(100*10)=31 < MINIMUM_LIQUIDITY(1000) → rejected
-        client.add_liquidity(&caller, &100_i128, &10_i128);
+        client.add_liquidity(&caller, &100_i128, &10_i128, &0, &0, &0, &u64::MAX);
     }
 
     // -----------------------------------------------------------------------
@@ -1691,11 +1816,14 @@ mod inline_test {
         let id = env.register(AmmContract, ());
         let client = AmmContractClient::new(&env, &id);
 
-        let token_a = Address::generate(&env);
-        let token_b = Address::generate(&env);
+        let token_a = crate::swap_test_util::register_token(&env);
+        let token_b = crate::swap_test_util::register_token(&env);
         let caller = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let trader = crate::swap_test_util::new_trader(&env, &token_a, &token_b);
 
-        client.init_pool(&1_000_000, &1_000_000, &token_a, &token_b);
+        client.init_pool(&admin, &1_000_000, &1_000_000, &token_a, &token_b);
+        crate::swap_test_util::fund_pool(&env, &id, &token_a, &token_b, 1_000_000, 1_000_000);
 
         // Before any swap, the observation list is empty.
         assert_eq!(
@@ -1705,7 +1833,7 @@ mod inline_test {
         );
 
         // --- swap_a_for_b ---
-        client.swap_a_for_b(&1_000);
+        client.swap_a_for_b(&trader, &1_000, &0);
         assert_eq!(
             client.get_twap_observations().len(),
             1,
@@ -1713,7 +1841,7 @@ mod inline_test {
         );
 
         // --- swap_b_for_a ---
-        client.swap_b_for_a(&1_000);
+        client.swap_b_for_a(&trader, &1_000, &0);
         assert_eq!(
             client.get_twap_observations().len(),
             2,

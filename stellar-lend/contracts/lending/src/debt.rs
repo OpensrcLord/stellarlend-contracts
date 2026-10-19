@@ -352,26 +352,13 @@ fn uncached_borrow_rate_computation(env: &Env) -> BorrowRateComputation {
 /// fresh `RateSnapshot`. Each cache miss also writes one utilization sample for
 /// the current ledger into the bounded utilization-history ring buffer.
 pub fn cached_borrow_rate(env: &Env) -> i128 {
-    let ledger_sequence = env.ledger().sequence();
-    let key = DataKey::BorrowRateCache(ledger_sequence);
-
-    if let Some(cache) = env
-        .storage()
-        .temporary()
-        .get::<DataKey, BorrowRateCache>(&key)
-    {
-        if cache.ledger_sequence == ledger_sequence {
-            return cache.rate_bps;
-        }
-    }
-
+    // NOTE: the original per-ledger temporary-storage cache was keyed by the
+    // current ledger sequence, which makes the transaction footprint depend on
+    // the ledger that closes the transaction. Simulated footprints then never
+    // match on-chain execution (the call traps). The rate is cheap to compute,
+    // so it is computed directly each call.
     let computation = uncached_borrow_rate_computation(env);
     write_utilization_sample(env, computation.utilization_bps);
-    let cache = BorrowRateCache {
-        ledger_sequence,
-        rate_bps: computation.rate_bps,
-    };
-    env.storage().temporary().set(&key, &cache);
     computation.rate_bps
 }
 
@@ -465,7 +452,11 @@ pub fn settle_accrual(
     Ok(DebtPosition {
         principal,
         borrow_index_snapshot: position.borrow_index_snapshot,
-        last_update: now,
+        // A clock that moves backwards (ledger rollback, delayed retry replayed
+        // after a newer one) must not rewrite the accrual timeline. Keep the
+        // furthest timestamp seen; `elapsed_seconds` already clamps the elapsed
+        // window to zero so no interest is invented either way.
+        last_update: position.last_update.max(now),
     })
 }
 
@@ -603,24 +594,41 @@ pub fn uncached_borrow_rate(env: &Env) -> i128 {
     compute_borrow_rate_from_snapshot(env, &snapshot).rate_bps
 }
 
+/// Compute utilization (bps) from an aggregate snapshot, bounded to
+/// `[0, BPS_DENOM]` (0 %..100 %).
+///
+/// # Boundedness invariant
+///
+/// When debt transiently exceeds supply (e.g. during bad-debt, partial
+/// write-off, or a supply draw-down that outpaces debt), the raw `debt / supply`
+/// ratio can exceed 100 %. The rate model is only well-defined on `[0, 100 %]`,
+/// so the value is capped at 100 % before it reaches
+/// [`rate_model::compute_borrow_rate`]. This keeps the borrow-rate computation
+/// bounded and deterministic at maximum utilization instead of feeding an
+/// out-of-range utilization to the model.
+pub fn compute_utilization_bps(snapshot: &RateSnapshot) -> Result<i128, DebtError> {
+    if snapshot.total_supply <= 0 {
+        return Ok(0);
+    }
+    snapshot
+        .total_debt
+        .checked_mul(BPS_DENOM)
+        .ok_or(DebtError::Overflow)?
+        .checked_div(snapshot.total_supply)
+        .ok_or(DebtError::Overflow)
+        .map(|raw| raw.min(BPS_DENOM))
+}
+
 /// Computes utilization and borrow rate from a preloaded aggregate snapshot.
 ///
 /// Utilization uses checked arithmetic and falls back to zero when supply is
 /// non-positive. Overflow in `debt * 10_000` returns [`DebtError::Overflow`].
+/// Utilization is bounded to `[0, BPS_DENOM]`; see [`compute_utilization_bps`].
 pub(crate) fn try_compute_borrow_rate_from_snapshot(
     env: &Env,
     snapshot: &RateSnapshot,
 ) -> Result<BorrowRateComputation, DebtError> {
-    let utilization_bps = if snapshot.total_supply > 0 {
-        snapshot
-            .total_debt
-            .checked_mul(BPS_DENOM)
-            .ok_or(DebtError::Overflow)?
-            .checked_div(snapshot.total_supply)
-            .ok_or(DebtError::Overflow)?
-    } else {
-        0
-    };
+    let utilization_bps = compute_utilization_bps(snapshot)?;
 
     let rate_bps = match &snapshot.params {
         Some(p) => {
@@ -751,6 +759,11 @@ const KEY_ACCRUAL_LOG: &str = "accrual_log";
 /// Append a settle_accrual_split result to the persistent log and emit a
 /// `settle_accrual_split` contract event for off-chain indexers.
 ///
+/// The log is a bounded ring buffer capped at [`MAX_ACCRUAL_LOG_SIZE`] entries.
+/// When the cap is reached the oldest entry is evicted before the newest is
+/// appended, keeping persistent-storage rent cost and read/decode cost
+/// deterministically bounded regardless of protocol lifetime.
+///
 /// Call this immediately after `settle_accrual_split` so the split is
 /// recorded for both on-chain history (via `get_accrual_split_log`) and
 /// off-chain TWAP/revenue attribution consumers.
@@ -768,6 +781,18 @@ pub fn record_accrual_split(env: &Env, borrower: &Address, timestamp: u64, split
         .persistent()
         .get(&Symbol::new(env, KEY_ACCRUAL_LOG))
         .unwrap_or_else(|| Vec::new(env));
+
+    // Enforce the ring-buffer bound: evict oldest when at capacity.
+    let cap = crate::events::MAX_ACCRUAL_LOG_SIZE as u32;
+    if log.len() >= cap {
+        // Remove front (oldest) entry to make room.
+        let mut trimmed: Vec<AccrualSplitEntry> = Vec::new(env);
+        for i in 1..log.len() {
+            trimmed.push_back(log.get(i).unwrap());
+        }
+        log = trimmed;
+    }
+
     log.push_back(entry.clone());
     env.storage()
         .persistent()

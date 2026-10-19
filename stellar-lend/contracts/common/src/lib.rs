@@ -116,6 +116,39 @@ pub enum LendingError {
     InvalidRateParams = 7006,
     /// Liquidation grace period exceeds the protocol maximum.
     InvalidLiquidationGracePeriod = 7007,
+    /// Config backup not found.
+    BackupNotFound = 8001,
+    /// `receive` called with a payload version other than `1`.
+    InvalidPayloadVersion = 1013,
+    /// `receive` called with a payload that is too short, too long, or
+    /// contains values that cannot be decoded into the expected types.
+    MalformedPayload = 1014,
+    /// `receive` called with an action `Symbol` that is not `"deposit"`
+    /// or `"repay"`.
+    AssetNotSupported = 1015,
+    /// `receive` called with `from` equal to the token asset or the lending
+    /// contract itself (prevents self-call / reentrancy attacks).
+    UnauthorizedSender = 1016,
+    /// Isolation-mode ceiling would be exceeded by the current operation
+    /// or ceiling value is below existing debt.
+    IsolationCeilingBelowDebt = 2012,
+    /// Isolation-mode debt tracking invariant violation detected.
+    IsolationDebtInvariant = 2013,
+    /// The upgrade proposal has been cancelled and cannot be acted on.
+    UpgradeProposalCancelled = 4012,
+    /// The upgrade proposal is not in a cancellable (pending) state.
+    UpgradeProposalNotCancellable = 4013,
+    /// The upgrade approver set changed after the proposal was created, so
+    /// in-flight approvals are no longer authorized to execute.
+    ApproverSetChanged = 4014,
+    /// A stale/duplicate upgrade submission would create contradictory state
+    /// and is rejected rather than silently re-applied.
+    UpgradeSubmissionConflict = 4015,
+    /// The recorded approval binding does not match the expected nonce-bound
+    /// domain-separated authorization for this proposal/approver pair.
+    ApprovalBindingMismatch = 4016,
+    /// A prepared operation expired before commit.
+    OperationExpired = 4017,
 }
 
 /// Multiply `value` by `rate_bps` and divide by [`BPS_DENOM`].
@@ -133,7 +166,7 @@ pub enum LendingError {
 /// ```
 #[inline]
 pub fn scale_bps(value: i128, rate_bps: i128) -> Option<i128> {
-    if rate_bps < 0 || rate_bps > BPS_DENOM {
+    if !(0..=BPS_DENOM).contains(&rate_bps) {
         return None;
     }
     value.checked_mul(rate_bps)?.checked_div(BPS_DENOM)
@@ -154,7 +187,7 @@ pub fn scale_bps(value: i128, rate_bps: i128) -> Option<i128> {
 /// ```
 #[inline]
 pub fn unscale_bps(value: i128, rate_bps: i128) -> Option<i128> {
-    if rate_bps <= 0 || rate_bps > BPS_DENOM {
+    if !(1..=BPS_DENOM).contains(&rate_bps) {
         return None;
     }
     value.checked_mul(BPS_DENOM)?.checked_div(rate_bps)
@@ -220,7 +253,8 @@ pub fn pow10_checked(exp: u32) -> Option<i128> {
 /// // Same decimals: no conversion
 /// assert_eq!(normalize_price(1_234_567, 18), Some(1_234_567));
 /// // Asset has more decimals: floor division
-/// assert_eq!(normalize_price(1_234_567_000, 20), Some(12_345));
+/// // 1_234_567_890 / 10^(20 - 18) = 12_345_678.9 → 12_345_678 (floor)
+/// assert_eq!(normalize_price(1_234_567_890, 20), Some(12_345_678));
 /// ```
 #[inline]
 pub fn normalize_price(raw_price: i128, asset_decimals: u32) -> Option<i128> {
@@ -269,6 +303,9 @@ mod bps_roundtrip_test;
 #[cfg(test)]
 mod bps_inverse_proptest;
 
+#[cfg(any(test, feature = "testutils"))]
+pub mod error_codes_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,8 +333,24 @@ mod tests {
     }
 
     #[test]
-    fn scale_bps_overflow_returns_none() {
-        // i128::MAX * 1 overflows in checked_mul → None
+    fn scale_bps_max_value_boundaries() {
+        // The final division by BPS_DENOM cannot overflow, so any input whose
+        // intermediate `value * rate_bps` product still fits in i128 scales
+        // losslessly at a 100% rate.
+        assert_eq!(
+            scale_bps(i128::MAX / BPS_DENOM, BPS_DENOM),
+            Some(i128::MAX / BPS_DENOM)
+        );
+        assert_eq!(
+            scale_bps(i128::MIN / BPS_DENOM, BPS_DENOM),
+            Some(i128::MIN / BPS_DENOM)
+        );
+        // Products that overflow i128 — even when the scaled *result* would
+        // fit — return None per the documented overflow contract (never wrap).
+        // This mirrors `scale_overflow_max_times_two` in `bps_roundtrip_test`
+        // and the `prop_scale_matches_reference` reference oracle.
+        assert_eq!(scale_bps(i128::MAX, BPS_DENOM), None);
+        assert_eq!(scale_bps(i128::MIN, BPS_DENOM), None);
         assert_eq!(scale_bps(i128::MAX, 2), None);
     }
 
@@ -371,6 +424,10 @@ mod tests {
         assert_eq!(LendingError::AlreadyInitialized as u32, 1010);
         assert_eq!(LendingError::PositionHealthy as u32, 1011);
         assert_eq!(LendingError::RepayAmountTooHigh as u32, 1012);
+        assert_eq!(LendingError::InvalidPayloadVersion as u32, 1013);
+        assert_eq!(LendingError::MalformedPayload as u32, 1014);
+        assert_eq!(LendingError::AssetNotSupported as u32, 1015);
+        assert_eq!(LendingError::UnauthorizedSender as u32, 1016);
         assert_eq!(LendingError::DebtCeilingExceeded as u32, 2001);
         assert_eq!(LendingError::DepositCapExceeded as u32, 2002);
         assert_eq!(LendingError::BorrowCapExceeded as u32, 2003);
@@ -381,6 +438,8 @@ mod tests {
         assert_eq!(LendingError::IsolationCeilingExceeded as u32, 2009);
         assert_eq!(LendingError::InvalidIsolationCeiling as u32, 2010);
         assert_eq!(LendingError::InvalidLiquidationParams as u32, 2011);
+        assert_eq!(LendingError::IsolationCeilingBelowDebt as u32, 2012);
+        assert_eq!(LendingError::IsolationDebtInvariant as u32, 2013);
         assert_eq!(LendingError::AssetNotConfigured as u32, 3001);
         assert_eq!(LendingError::PriceFeedNotFound as u32, 3002);
         assert_eq!(LendingError::HealthFactorTooLow as u32, 3003);
@@ -397,6 +456,12 @@ mod tests {
         assert_eq!(LendingError::ApproverNotFound as u32, 4009);
         assert_eq!(LendingError::MaxApproversReached as u32, 4010);
         assert_eq!(LendingError::InvalidUpgradeConfig as u32, 4011);
+        assert_eq!(LendingError::UpgradeProposalCancelled as u32, 4012);
+        assert_eq!(LendingError::UpgradeProposalNotCancellable as u32, 4013);
+        assert_eq!(LendingError::ApproverSetChanged as u32, 4014);
+        assert_eq!(LendingError::UpgradeSubmissionConflict as u32, 4015);
+        assert_eq!(LendingError::ApprovalBindingMismatch as u32, 4016);
+        assert_eq!(LendingError::OperationExpired as u32, 4017);
         assert_eq!(LendingError::InvalidOracleSignature as u32, 5001);
         assert_eq!(LendingError::StaleOracleTimestamp as u32, 5002);
         assert_eq!(LendingError::OraclePubkeyNotSet as u32, 5003);
@@ -409,5 +474,7 @@ mod tests {
         assert_eq!(LendingError::InvalidLiquidationIncentiveBps as u32, 7002);
         assert_eq!(LendingError::InvalidDepositCap as u32, 7005);
         assert_eq!(LendingError::InvalidRateParams as u32, 7006);
+        assert_eq!(LendingError::InvalidLiquidationGracePeriod as u32, 7007);
+        assert_eq!(LendingError::BackupNotFound as u32, 8001);
     }
 }
